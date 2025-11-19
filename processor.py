@@ -1,93 +1,112 @@
 import cv2
 import numpy as np
 
-# ===== 1. Load & deskew (basic) =====
-img = cv2.imread("table.jpg")
-orig = img.copy()
-gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+def warp_table_manual(image, corners):
+    """
+    Warp table so that the 4 clicked corners map to the edges of the corrected image.
+    corners: np.array([[x1,y1],[x2,y2],[x3,y3],[x4,y4]]) in any order
+    Returns: warped image
+    """
+    # Auto-sort corners to TL, TR, BR, BL
+    s = corners.sum(axis=1)
+    diff = np.diff(corners, axis=1)
 
-# Light blur helps remove noise
-gray_blur = cv2.GaussianBlur(gray, (5,5), 0)
+    tl = corners[np.argmin(s)]
+    br = corners[np.argmax(s)]
+    tr = corners[np.argmin(diff)]
+    bl = corners[np.argmax(diff)]
 
-# ===== 2. Detect strong vertical lines (10 groups) =====
-th = cv2.adaptiveThreshold(gray_blur, 255,
-                           cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                           cv2.THRESH_BINARY_INV, 15, 3)
+    ordered = np.array([tl, tr, br, bl], dtype="float32")
 
-kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 80))
-v_lines = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel_v)
+    # Compute width and height based on average of opposite sides
+    widthTop = np.linalg.norm(tr - tl)
+    widthBottom = np.linalg.norm(br - bl)
+    maxWidth = int((widthTop + widthBottom)/2)
 
-cnts, _ = cv2.findContours(v_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    heightLeft = np.linalg.norm(bl - tl)
+    heightRight = np.linalg.norm(br - tr)
+    maxHeight = int((heightLeft + heightRight)/2)
 
-x_positions = []
-for c in cnts:
-    x, y, w, h = cv2.boundingRect(c)
-    if h > img.shape[0] * 0.2:     # real column divider
-        x_positions.append(x)
+    # Destination rectangle
+    dst = np.array([
+        [0,0],
+        [maxWidth-1,0],
+        [maxWidth-1,maxHeight-1],
+        [0,maxHeight-1]
+    ], dtype="float32")
 
-x_positions = sorted(x_positions)
+    # Perspective transform
+    M = cv2.getPerspectiveTransform(ordered, dst)
+    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+    return warped
 
-# Add image left & right edges
-x_positions = [0] + x_positions + [img.shape[1]]
+def process_table(image_bytes, corners, cols=48):
+    """
+    Digitize the table after perspective warp
+    Returns: matrix, column sums, overlay image
+    """
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Could not decode image")
 
-# ===== 3. Subdivide each visible col into 4 equal parts =====
-col_bounds = []
-for i in range(len(x_positions)-1):
-    start = x_positions[i]
-    end = x_positions[i+1]
-    width = (end - start) / 4
-    for k in range(4):
-        col_bounds.append(int(start + k * width))
-col_bounds.append(img.shape[1])  # last boundary
+    # Warp table using the submitted corners
+    warped = warp_table_manual(img, corners)
 
-# Clean & sort
-col_bounds = sorted(col_bounds)
-COLS = 40     # total sub-columns
-assert len(col_bounds) == COLS + 1
+    # Compute number of rows based on column width
+    height, width = warped.shape[:2]
+    cell_width = width / cols
+    rows = int(round(height / cell_width))
+    row_height = height / rows
+    col_width = width / cols
 
-# ===== 4. Detect horizontal lines (rows) =====
-kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (100, 1))
-h_lines = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel_h)
+    hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
+    matrix = np.zeros((rows, cols), dtype=int)
 
-cnts_h, _ = cv2.findContours(h_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for r in range(rows):
+        y1 = int(r*row_height)
+        y2 = int((r+1)*row_height)
+        for c in range(cols):
+            x1 = int(c*col_width)
+            x2 = int((c+1)*col_width)
+            cell = hsv[y1:y2, x1:x2]
+            S = cell[:,:,1].mean()
+            V = cell[:,:,2].mean()
+            matrix[r,c] = 1 if S > 35 or V < 160 else 0
 
-y_positions = []
-for c in cnts_h:
-    x, y, w, h = cv2.boundingRect(c)
-    if w > img.shape[1] * 0.5:  # long horizontal line
-        y_positions.append(y)
+    col_sums = matrix.sum(axis=0)
+    overlay_img = draw_overlay(warped, matrix)
 
-y_positions = sorted(y_positions)
-ROWS = len(y_positions) - 1     # row count inferred
-row_bounds = sorted(y_positions)
+    return matrix, col_sums, overlay_img
 
-# ===== 5. Create matrix and classify each cell =====
-matrix = np.zeros((ROWS, COLS), dtype=int)
+def draw_overlay(image, matrix, alpha=0.3, border_color=(255,255,255), border_thickness=1):
+    """
+    Draw overlay with shaded cells + grid borders
+    """
+    overlay_img = image.copy()
+    mask = np.zeros_like(image, dtype=np.uint8)
+    rows, cols = matrix.shape
+    height, width = image.shape[:2]
+    row_height = height / rows
+    col_width = width / cols
 
-hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    for r in range(rows):
+        y1 = int(r*row_height)
+        y2 = int((r+1)*row_height)
+        for c in range(cols):
+            x1 = int(c*col_width)
+            x2 = int((c+1)*col_width)
+            color = (0,255,0) if matrix[r,c]==1 else (0,0,255)
+            cv2.rectangle(mask, (x1,y1), (x2,y2), color, -1)
 
-for r in range(ROWS):
-    y1 = row_bounds[r]
-    y2 = row_bounds[r+1]
+    overlay_img = cv2.addWeighted(mask, alpha, overlay_img, 1-alpha, 0)
 
-    for c in range(COLS):
-        x1 = col_bounds[c]
-        x2 = col_bounds[c+1]
+    # Draw grid borders
+    for r in range(rows+1):
+        y = int(r*row_height)
+        cv2.line(overlay_img, (0,y), (width,y), border_color, border_thickness)
+    for c in range(cols+1):
+        x = int(c*col_width)
+        cv2.line(overlay_img, (x,0), (x,height), border_color, border_thickness)
 
-        cell = hsv[y1:y2, x1:x2]
-
-        # Compute mean saturation (colored cells very high)
-        S = cell[:,:,1].mean()
-
-        # Compute mean brightness
-        V = cell[:,:,2].mean()
-
-        # Threshold for any shaded region
-        if S > 35 or V < 160:  
-            matrix[r, c] = 1
-        else:
-            matrix[r, c] = 0
-
-# ===== 6. Column totals =====
-col_sums = matrix.sum(axis=0)
-print("Column totals =", col_sums)
+    return overlay_img
